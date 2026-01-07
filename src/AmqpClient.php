@@ -102,11 +102,15 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     public function onConnect($callback) {
         $this -> onConnectCallbacks[] = $callback;
         $this -> maybeCallConnectCallback($callback);
+
+        return $this;
     }
 
     public function onceConnect($callback) {
         $this -> onceConnectCallbacks[] = $callback;
         $this -> maybeCallConnectCallback($callback);
+
+        return $this;
     }
 
     public function declareExchange(
