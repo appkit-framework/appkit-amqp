@@ -1,0 +1,23 @@
+{
+    "name": "appkit/amqp",
+    "type": "library",
+    "description": "High-level AMQP client for the AppKit framework",
+    "license": "MIT",
+    "require": {
+        "appkit/async": "^1.0",
+        "appkit/bunny": "^1.0",
+        "appkit/health": "^1.0",
+        "appkit/start-stop": "^1.0",
+        "react/async": "^4.3",
+        "react/promise": "^3.3"
+    },
+    "autoload": {
+        "psr-4": {
+            "AppKit\\Amqp\\": "src/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true
+    }
+}
