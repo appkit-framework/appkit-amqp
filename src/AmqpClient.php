@@ -21,7 +21,6 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     private $isConnected = false;
     private $isStopping = false;
     private $onConnectCallbacks = [];
-    private $onceConnectCallbacks = [];
     private $connectTask;
     private $channels;
     private $consumers;
@@ -101,13 +100,6 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
 
     public function onConnect($callback) {
         $this -> onConnectCallbacks[] = $callback;
-        $this -> maybeCallConnectCallback($callback);
-
-        return $this;
-    }
-
-    public function onceConnect($callback) {
-        $this -> onceConnectCallbacks[] = $callback;
         $this -> maybeCallConnectCallback($callback);
 
         return $this;
@@ -410,11 +402,6 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         }
 
         $this -> isConnected = true;
-
-        foreach($this -> onceConnectCallbacks as $key => $callback) {
-            $this -> maybeCallConnectCallback($callback);
-            unset($this -> onceConnectCallbacks[$key]);
-        }
 
         foreach($this -> onConnectCallbacks as $callback)
             $this -> maybeCallConnectCallback($callback);
