@@ -67,11 +67,12 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         if($this -> isConnected) {
             // Cancel all consumers
             foreach($this -> consumers as $tag => $_) {
+                $this -> log -> warning("Consumer $tag is still active at shutdown");
                 try {
                     $this -> cancelConsumer($tag);
-                    $this -> log -> debug("Canceled consumer $tag");
+                    $this -> log -> info("Canceled consumer $tag");
                 } catch(Throwable $e) {
-                    $this -> log -> warning("Failed to cancel consumer $tag", $e);
+                    $this -> log -> error("Failed to cancel consumer $tag", $e);
                 }
             }
 
@@ -326,7 +327,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         $channelName = "consumer_$consumerTag";
 
         $this -> callChannel($channelName, 'cancel', [ $consumerTag ]);
-        $this -> log -> debug("Canceled consumer tag $consumerTag on server");
+        $this -> log -> debug("Canceled consumer tag $consumerTag on the server");
 
         $pendingMessages = $this -> consumers[$consumerTag]['pendingMessages'];
         if($pendingMessages > 0) {
