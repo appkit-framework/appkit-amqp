@@ -11,7 +11,9 @@ use function AppKit\Async\delay;
 
 use Throwable;
 use Bunny\Client;
+use Bunny\Protocol\MethodBasicNackFrame;
 use React\Promise\Deferred;
+use Ramsey\Uuid\Uuid;
 use function React\Async\async;
 use function React\Async\await;
 
@@ -25,6 +27,8 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     private $channels;
     private $consumers;
     private $client;
+    private $confirmDeferreds;
+    private $returnedMessages = [];
 
     /****************************************
      * CONSTRUCTOR
@@ -248,10 +252,50 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         $exchange = '',
         $routingKey = '',
         $mandatory = false,
-        $immediate = false
+        $immediate = false,
+        $confirm = false
     ) {
-        // TODO: If the publish() fails, Bunny does not throw an exception
-        $this -> callChannel('default', 'publish', [
+        if(($mandatory || $immediate) && !$confirm)
+            throw new AmqpClientException('Mandatory or immediate requires confirm to be true');
+
+        $this -> ensureConnected();
+
+        $channelName = 'publish';
+        if($confirm)
+            $channelName .= '_confirm';
+
+        if(!isset($this -> channels[$channelName])) {
+            $this -> callChannel($channelName, 'addReturnListener', [
+                function($message, $frame) {
+                    return $this -> onMessageReturn($message, $frame);
+                }
+            ]);
+
+            if($confirm) {
+                try {
+                    $this -> callChannel($channelName, 'confirmSelect', [
+                        function($frame) {
+                            return $this -> onConfirmFrame($frame);
+                        }
+                    ]);
+                    $this -> log -> debug("Enabled confirm mode on channel $channelName");
+                } catch(Throwable $e) {
+                    $error = 'Failed to enable confirm mode';
+                    $this -> log -> error("$error on channel $channelName");
+                    throw new AmqpClientException(
+                        $error,
+                        previous: $e
+                    );
+                }
+
+                $this -> confirmDeferreds = [];
+            }
+        }
+
+        $messageId = $this -> genMessageId();
+        $headers['message-id'] = $messageId;
+
+        $deliveryTag = $this -> callChannel($channelName, 'publish', [
             $body,
             $headers,
             $exchange,
@@ -259,7 +303,32 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
             $mandatory,
             $immediate
         ]);
-        return $this;
+
+        if($confirm) {
+            $confirmDeferred = new Deferred();
+            $this -> confirmDeferreds[$deliveryTag] = $confirmDeferred;
+
+            $this -> returnedMessages[$messageId] = null;
+        
+            $exception = null;
+
+            try {
+                await($confirmDeferred -> promise());
+            } catch(AmqpClientException $e) {
+                $exception = $e;
+            }
+            unset($this -> confirmDeferreds[$deliveryTag]);
+
+            if($this -> returnedMessages[$messageId]) {
+                $exception = $this -> returnedMessages[$messageId];
+                unset($this -> returnedMessages[$messageId]);
+            }
+
+            if($exception)
+                throw $exception;
+        }
+
+        return $messageId;
     }
 
     public function consume(
@@ -278,7 +347,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         $consumerTag ??= bin2hex(random_bytes(8));
         if(isset($this -> consumers[$consumerTag]))
             throw new AmqpClientException("Consumer tag $consumerTag already in use");
-        $channelName = "consumer_$consumerTag";
+        $channelName = "consume_$consumerTag";
 
         $prefetchCount ??= $concurrency;
         try {
@@ -324,7 +393,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         if(!isset($this -> consumers[$consumerTag]))
             throw new AmqpClientException("Consumer $consumerTag does not exist");
 
-        $channelName = "consumer_$consumerTag";
+        $channelName = "consume_$consumerTag";
 
         $this -> callChannel($channelName, 'cancel', [ $consumerTag ]);
         $this -> log -> debug("Canceled consumer tag $consumerTag on the server");
@@ -427,6 +496,17 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
                     new AmqpClientException('Connection lost while still processing messages')
                 );
         }
+
+        // Reject all delivery confirmations
+        $confirmDeferredCount = count($this -> confirmDeferreds);
+        if($confirmDeferredCount > 0)
+            $this -> log -> warning(
+                "Connection lost while awaiting delivery confirmation for $confirmDeferredCount messages"
+            );
+        foreach($this -> confirmDeferreds as $deferred)
+            $deferred -> reject(
+                new AmqpClientException('Connection lost before delivery confirmation')
+            );
 
         if($this -> isStopping)
             return;
@@ -535,7 +615,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     }
 
     /****************************************
-     * MESSAGE INTERNALS
+     * CONSUMING INTERNALS
      ****************************************/
     
     private function handleMessage($message, $consumerTag) {
@@ -568,9 +648,9 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         } else {
             try {
                 if($ack)
-                    $this -> callChannel("consumer_$consumerTag", 'ack', [$message]);
+                    $this -> callChannel("consume_$consumerTag", 'ack', [$message]);
                 else
-                    $this -> callChannel("consumer_$consumerTag", 'reject', [$message]);
+                    $this -> callChannel("consume_$consumerTag", 'reject', [$message]);
             } catch(Throwable $e) {
                 $this -> log -> error(
                     'Failed to ' .
@@ -587,5 +667,63 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         ) {
             $this -> consumers[$consumerTag]['cancelDeferred'] -> resolve(null);
         }
+    }
+
+    /****************************************
+     * PUBLISHING INTERNALS
+     ****************************************/
+
+    private function onConfirmFrame($frame) {
+        $ack = ! $frame instanceof MethodBasicNackFrame;
+
+        if(! $ack)
+            $this -> log -> warning(
+                'Received NACK frame for ' .
+                $frame -> multiple ? 'multiple messages up to' : 'message with' .
+                ' delivery tag ' .
+                $frame -> deliveryTag
+            );
+
+        if($frame -> multiple) {
+            foreach($this -> confirmDeferreds as $dtag => $_) {
+                if($dtag > $frame -> deliveryTag)
+                    break;
+
+                $this -> fulfillConfirmDeferred($dtag, $ack);
+            }
+        } else {
+            $this -> fulfillConfirmDeferred($frame -> deliveryTag, $ack);
+        }
+    }
+
+    private function fulfillConfirmDeferred($deliveryTag, $ack) {
+        if($ack)
+            $this -> confirmDeferreds[$deliveryTag] -> resolve(null);
+        else
+            $this -> confirmDeferreds[$deliveryTag] -> reject(
+                new AmqpClientException('Negative acknowledgment received from the server')
+            );
+    }
+
+    private function onMessageReturn($message, $frame) {
+        $messageId = $message -> headers['message-id'];
+
+        $this -> log -> debug(
+            "Message $messageId was returned with reply text: " .
+            $frame -> replyText
+        );
+
+        if(array_key_exists($messageId, $this -> returnedMessages))
+            $this -> returnedMessages[$messageId] = new AmqpReturnException($frame -> replyText);
+        else
+            $this -> log -> warning("Unhandled return of message $messageId");
+    }
+
+    private function genMessageId() {
+        // UUID v4
+        $data = random_bytes(16);
+        $data[6] = chr(ord($data[6]) & 0x0f | 0x40);
+        $data[8] = chr(ord($data[8]) & 0x3f | 0x80);
+        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
     }
 }
