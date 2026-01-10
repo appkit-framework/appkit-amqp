@@ -621,45 +621,48 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     private function handleMessage($message, $consumerTag) {
         $this -> consumers[$consumerTag]['pendingMessages']++;
 
+        $messageIdStr = $message -> headers['message-id'] ? 'without id';
+
+        $nack = null;
         try {
-            try {
-                $this -> consumers[$consumerTag]['callback']($message -> content, $message -> headers);
-                $ack = true;
-            } catch(AmqpReject $e) {
-                throw $e;
-            } catch(Throwable $e) {
-                $this -> log -> error(
-                    "Uncaught exception from consumer $consumerTag message callback",
-                    $e
-                );
-                throw new AmqpReject();
-            }
-        } catch(AmqpReject $e) {
-            $ack = false;
+            $this -> consumers[$consumerTag]['callback']($message -> content, $message -> headers);
+        } catch(AmqpNackReject | AmqpNackRequeue $e) {
+            $nack = $e;
+        } catch(Throwable $e) {
+            $this -> log -> error(
+                "Uncaught exception while handling message $messageIdStr by consumer $consumerTag",
+                $e
+            );
+            $nack = new AmqpNackRequeue('Exception in consumer callback', previous: $e);
         }
 
-        $this -> consumers[$consumerTag]['pendingMessages']--;
-
         if($this -> consumers[$consumerTag]['noAck']) {
-            if(! $ack)
-                $this -> log -> warning(
-                    "Attempt to reject message consumed by $consumerTag, but noAck is enabled"
+            if($nack)
+                $this -> log -> error(
+                    "Cannot NACK message $messageIdStr, because noAck is set for consumer $consumerTag",
+                    $e
                 );
         } else {
             try {
-                if($ack)
+                if($nack instanceof AmqpNackReject) {
+                    $logVerb = 'reject';
+                    $this -> callChannel("consume_$consumerTag", 'reject', [$message, false]);
+                } else if($nack instanceof AmqpNackRequeue) {
+                    $logVerb = 'requeue';
+                    $this -> callChannel("consume_$consumerTag", 'reject', [$message, true]);
+                } else {
+                    $logVerb = 'ack';
                     $this -> callChannel("consume_$consumerTag", 'ack', [$message]);
-                else
-                    $this -> callChannel("consume_$consumerTag", 'reject', [$message]);
+                }
             } catch(Throwable $e) {
                 $this -> log -> error(
-                    'Failed to ' .
-                        $ack ? 'ack' : 'reject' .
-                        " message consumed by $consumerTag",
+                    "Failed to $logVerb message $messageIdStr consumed by $consumerTag"
                     $e
                 );
             }
         }
+
+        $this -> consumers[$consumerTag]['pendingMessages']--;
 
         if(
             $this -> consumers[$consumerTag]['pendingMessages'] == 0 &&

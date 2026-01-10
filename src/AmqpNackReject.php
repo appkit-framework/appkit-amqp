@@ -4,4 +4,4 @@ namespace AppKit\Amqp;
 
 use Exception;
 
-class AmqpReject extends Exception {}
+class AmqpNackReject extends Exception {}
