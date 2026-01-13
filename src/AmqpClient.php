@@ -13,7 +13,6 @@ use Throwable;
 use Bunny\Client;
 use Bunny\Protocol\MethodBasicNackFrame;
 use React\Promise\Deferred;
-use Ramsey\Uuid\Uuid;
 use function React\Async\async;
 use function React\Async\await;
 
@@ -104,10 +103,12 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
      ****************************************/
 
     public function onConnect($callback, $instant = false) {
-        $this -> onConnectCallbacks[] = $callback;
+        $i = count($this -> onConnectCallbacks);
+        $this -> onConnectCallbacks[$i] = $callback;
+        $this -> log -> debug("Registered connect callback $i");
 
         if($instant)
-            $this -> maybeCallConnectCallback($callback);
+            $this -> maybeCallConnectCallback($i);
 
         return $this;
     }
@@ -270,6 +271,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
                     return $this -> onMessageReturn($message, $frame);
                 }
             ]);
+            $this -> log -> debug("Configured return listener on channel $channelName");
 
             if($confirm) {
                 try {
@@ -295,6 +297,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         $messageId = $this -> genMessageId();
         $headers['message-id'] = $messageId;
 
+        // Returns delivery tag only in confirm mode
         $deliveryTag = $this -> callChannel($channelName, 'publish', [
             $body,
             $headers,
@@ -309,7 +312,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
             $this -> confirmDeferreds[$deliveryTag] = $confirmDeferred;
 
             $this -> returnedMessages[$messageId] = null;
-        
+
             $exception = null;
 
             try {
@@ -378,6 +381,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
             $arguments,
             $concurrency
         ]);
+
         $this -> consumers[$consumerTag] = [
             'callback' => $callback,
             'noAck' => $noAck,
@@ -395,26 +399,36 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
 
         $channelName = "consume_$consumerTag";
 
-        $this -> callChannel($channelName, 'cancel', [ $consumerTag ]);
-        $this -> log -> debug("Canceled consumer tag $consumerTag on the server");
+        try {
+            $this -> callChannel($channelName, 'cancel', [ $consumerTag ]);
+            $this -> log -> debug("Consumer $consumerTag canceled on the server");
+        } catch(Throwable $e) {
+            $this -> log -> error("Failed to cancel consumer $consumerTag on the server", $e);
+            throw $e;
+        }
 
         $pendingMessages = $this -> consumers[$consumerTag]['pendingMessages'];
         if($pendingMessages > 0) {
             $cancelDeferred = new Deferred();
             $this -> consumers[$consumerTag]['cancelDeferred'] = $cancelDeferred;
             $this -> log -> debug(
-                "Waiting for $pendingMessages messages before cleaning up consumer $consumerTag..."
+                "Waiting for $pendingMessages messages before cleaning up consumer $consumerTag"
             );
-            await($cancelDeferred -> promise());
+            try {
+                await($cancelDeferred -> promise());
+                $this -> log -> debug("Ready to cleanup consumer $consumerTag");
+            } catch(Throwable $e) {
+                $this -> log -> warning("Forcing cleanup consumer $consumerTag", $e);
+            }
         }
 
-        $this -> log -> debug("Cleaning up consumer $consumerTag");
         unset($this -> consumers[$consumerTag]);
         try {
             $this -> closeChannel($channelName);
         } catch(Throwable $e) {
             $this -> log -> error("Failed to close channel $channelName", $e);
         }
+        $this -> log -> debug("Cleaned up consumer $consumerTag");
 
         return $this;
     }
@@ -475,8 +489,8 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
 
         $this -> isConnected = true;
 
-        foreach($this -> onConnectCallbacks as $callback)
-            $this -> maybeCallConnectCallback($callback);
+        foreach($this -> onConnectCallbacks as $i => $_)
+            $this -> maybeCallConnectCallback($i);
     }
 
     private function onConnectionClose() {
@@ -520,12 +534,14 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
             throw new AmqpClientException('Client is not connected');
     }
 
-    private function maybeCallConnectCallback($callback) {
+    private function maybeCallConnectCallback($i) {
         if(! $this -> isConnected)
             return;
 
+        $this -> log -> debug("Calling connect callback $i");
+
         try {
-            $callback($this);
+            $this -> onConnectCallbacks[$i]($this);
         } catch(Throwable $e) {
             $this -> log -> error('Uncaught exception from connect callback', $e);
         }
@@ -594,14 +610,15 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
             $this -> log -> warning("Trying to close non-existent channel $channelName");
             return;
         }
+
+        $channelId = $this -> channels[$channelName]['channel'] -> getChannelId();
         $this -> channels[$channelName]['isClosing'] = true;
         $this -> channels[$channelName]['channel'] -> close();
         delay(0); // TODO: Same case as callChannel()
 
-        $channelId = $this -> channels[$channelName]['channel'] -> getChannelId();
-        $this -> log -> debug("Closed channel ${channelName}[${channelId}]");
-
         unset($this -> channels[$channelName]);
+
+        $this -> log -> debug("Closed channel ${channelName}[${channelId}]");
     }
 
     private function onChannelClose($channelName) {
@@ -621,7 +638,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     private function handleMessage($message, $consumerTag) {
         $this -> consumers[$consumerTag]['pendingMessages']++;
 
-        $messageIdStr = $message -> headers['message-id'] ? 'without id';
+        $messageIdStr = $message -> headers['message-id'] ?? 'without id';
 
         $nack = null;
         try {
@@ -645,10 +662,10 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         } else {
             try {
                 if($nack instanceof AmqpNackReject) {
-                    $logVerb = 'reject';
+                    $logVerb = 'reject (' . $nack -> getMessage() . ')';
                     $this -> callChannel("consume_$consumerTag", 'reject', [$message, false]);
                 } else if($nack instanceof AmqpNackRequeue) {
-                    $logVerb = 'requeue';
+                    $logVerb = 'requeue (' . $nack -> getMessage() . ')';
                     $this -> callChannel("consume_$consumerTag", 'reject', [$message, true]);
                 } else {
                     $logVerb = 'ack';
@@ -656,7 +673,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
                 }
             } catch(Throwable $e) {
                 $this -> log -> error(
-                    "Failed to $logVerb message $messageIdStr consumed by $consumerTag"
+                    "Failed to $logVerb message $messageIdStr consumed by $consumerTag",
                     $e
                 );
             }
