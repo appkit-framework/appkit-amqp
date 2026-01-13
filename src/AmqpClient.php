@@ -26,7 +26,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     private $channels;
     private $consumers;
     private $client;
-    private $confirmDeferreds;
+    private $confirmDeferreds = [];
     private $returnedMessages = [];
 
     /****************************************
