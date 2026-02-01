@@ -8,6 +8,7 @@
         "appkit/bunny": "^1.0",
         "appkit/health": "^1.0",
         "appkit/start-stop": "^1.0",
+        "evenement/evenement": "^3.0",
         "react/async": "^4.3",
         "react/promise": "^3.3"
     },

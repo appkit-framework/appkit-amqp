@@ -13,15 +13,18 @@ use Throwable;
 use Bunny\Client;
 use Bunny\Protocol\MethodBasicNackFrame;
 use React\Promise\Deferred;
+use Evenement\EventEmitterInterface;
+use Evenement\EventEmitterTrait;
 use function React\Async\async;
 use function React\Async\await;
 
-class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
+class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventEmitterInterface {
+    use EventEmitterTrait;
+
     private $log;
     private $clientConfig;
     private $isConnected = false;
     private $isStopping = false;
-    private $onConnectCallbacks = [];
     private $connectTask;
     private $channels;
     private $consumers;
@@ -101,17 +104,6 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     /****************************************
      * PUBLIC METHODS
      ****************************************/
-
-    public function onConnect($callback, $instant = false) {
-        $i = count($this -> onConnectCallbacks);
-        $this -> onConnectCallbacks[$i] = $callback;
-        $this -> log -> debug("Registered connect callback $i");
-
-        if($instant)
-            $this -> maybeCallConnectCallback($i);
-
-        return $this;
-    }
 
     public function declareExchange(
         $exchange,
@@ -488,9 +480,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
         }
 
         $this -> isConnected = true;
-
-        foreach($this -> onConnectCallbacks as $i => $_)
-            $this -> maybeCallConnectCallback($i);
+        $this -> emit('connect');
     }
 
     private function onConnectionClose() {
@@ -532,19 +522,6 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface {
     private function ensureConnected() {
         if(! $this -> isConnected)
             throw new AmqpClientException('Client is not connected');
-    }
-
-    private function maybeCallConnectCallback($i) {
-        if(! $this -> isConnected)
-            return;
-
-        $this -> log -> debug("Calling connect callback $i");
-
-        try {
-            $this -> onConnectCallbacks[$i]($this);
-        } catch(Throwable $e) {
-            $this -> log -> error('Uncaught exception from connect callback', $e);
-        }
     }
 
     /****************************************
