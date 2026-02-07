@@ -7,6 +7,8 @@ use AppKit\Health\HealthIndicatorInterface;
 use AppKit\Health\HealthCheckResult;
 use AppKit\Async\Task;
 use AppKit\Async\CanceledException;
+use function AppKit\Async\async;
+use function AppKit\Async\await;
 use function AppKit\Async\delay;
 
 use Throwable;
@@ -15,8 +17,6 @@ use Bunny\Protocol\MethodBasicNackFrame;
 use React\Promise\Deferred;
 use Evenement\EventEmitterInterface;
 use Evenement\EventEmitterTrait;
-use function React\Async\async;
-use function React\Async\await;
 
 class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventEmitterInterface {
     use EventEmitterTrait;
