@@ -44,7 +44,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $password = 'guest',
         $vhost    = '/'
     ) {
-        $this -> log = $log -> withModule($this);
+        $this -> log = $log -> withModule(static::class);
         $this -> clientConfig = [
             'host'     => $host,
             'port'     => $port,
