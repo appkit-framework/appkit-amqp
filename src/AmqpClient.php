@@ -411,8 +411,17 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
             'cancelDeferred' => null
         ];
         $this -> log -> debug(
-            'Started consumer',
-            [ 'consumerTag' => $consumerTag, 'queue' => $queue ]
+            'Created consumer',
+            [
+                'consumerTag' => $consumerTag,
+                'queue' => $queue,
+                'noLocal' => $noLocal,
+                'noAck' => $noAck,
+                'exclusive' => $exclusive,
+                'arguments' => $arguments,
+                'concurrency' => $concurrency,
+                'prefetchCount' => $prefetchCount
+            ]
         );
 
         return $consumerTag;
