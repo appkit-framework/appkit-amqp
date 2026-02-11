@@ -699,7 +699,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
      ****************************************/
 
     private function handleMessage($message, $consumerTag) {
-        $this -> log -> setContext('amqpMsg', $message -> headers['message-id'] ?? null);
+        $this -> log -> setContext('amqpMsgId', $message -> headers['message-id'] ?? null);
 
         $this -> consumers[$consumerTag]['pendingMessages']++;
 
