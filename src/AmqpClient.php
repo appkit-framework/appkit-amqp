@@ -60,6 +60,7 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
     
     public function start() {
         $this -> connect();
+        $this -> connectTask -> await();
     }
     
     public function stop() {
@@ -499,18 +500,9 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
      ****************************************/
 
     private function connect() {
-        $this -> log -> debug('Starting connect task');
-
         $this -> connectTask = new Task(function() {
             return $this -> connectRoutine();
-        });
-
-        try {
-            $this -> connectTask -> run() -> await();
-            $this -> log -> debug('Connect task completed');
-        } catch(CanceledException $e) {
-            $this -> log -> info('Connect task canceled');
-        }
+        }) -> run();
     }
 
     private function connectRoutine() {
@@ -524,9 +516,9 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
                 $this -> log -> debug('Trying to connect to AMQP server');
 
                 $this -> client = new Client($this -> clientConfig);
-                $this -> client -> once('close', async(function() {
+                $this -> client -> once('close', function() {
                    $this -> onConnectionClose();
-                }));
+                });
                 $this -> client -> connect();
 
                 $this -> log -> info('Connected to AMQP server');
