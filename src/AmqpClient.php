@@ -2,40 +2,11 @@
 
 namespace AppKit\Amqp;
 
-use AppKit\StartStop\StartStopInterface;
-use AppKit\Health\HealthIndicatorInterface;
-use AppKit\Health\HealthCheckResult;
-use AppKit\Async\Task;
-use AppKit\Async\CanceledException;
-use function AppKit\Async\async;
-use function AppKit\Async\await;
-use function AppKit\Async\delay;
+use AppKit\Client\AbstractClient;
 
-use Throwable;
-use Bunny\Client;
-use Bunny\Protocol\MethodBasicNackFrame;
-use React\Promise\Deferred;
-use Evenement\EventEmitterInterface;
-use Evenement\EventEmitterTrait;
+class AmqpClient extends AbstractClient implements AmqpClientInterface {
+    private $options;
 
-class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventEmitterInterface {
-    use EventEmitterTrait;
-
-    private $log;
-    private $clientConfig;
-    private $isConnected = false;
-    private $isStopping = false;
-    private $connectTask;
-    private $channels;
-    private $consumers;
-    private $client;
-    private $confirmDeferreds = [];
-    private $returnedMessages = [];
-
-    /****************************************
-     * CONSTRUCTOR
-     ****************************************/
-    
     function __construct(
         $log,
         $host     = '127.0.0.1',
@@ -44,8 +15,9 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $password = 'guest',
         $vhost    = '/'
     ) {
-        $this -> log = $log -> withModule(static::class);
-        $this -> clientConfig = [
+        parent::__construct($log -> withModule(static::class));
+
+        $this -> options = [
             'host'     => $host,
             'port'     => $port,
             'user'     => $user,
@@ -53,71 +25,6 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
             'vhost'    => $vhost
         ];
     }
-
-    /****************************************
-     * INTERFACE METHODS
-     ****************************************/
-    
-    public function start() {
-        $this -> connect();
-        $this -> connectTask -> await();
-    }
-    
-    public function stop() {
-        $this -> isStopping = true;
-
-        if($this -> connectTask -> getStatus() == Task::RUNNING) {
-            $this -> log -> debug('Connect task running during stop, canceling');
-            $this -> connectTask -> cancel() -> join();
-        }
-
-        if($this -> isConnected) {
-            // Cancel all consumers
-            $consumerCount = count($this -> consumers);
-            if($consumerCount > 0) {
-                $this -> log -> warning(
-                    'Shutdown with active consumers',
-                    [ 'consumerCount' => $consumerCount ]
-                );
-
-                foreach($this -> consumers as $consumerTag => $_) {
-                    try {
-                        $this -> cancelConsumer($consumerTag);
-                        $this -> log -> info(
-                            'Canceled consumer',
-                            [ 'consumerTag' => $consumerTag ]);
-                    } catch(Throwable $e) {
-                        $this -> log -> error(
-                            'Failed to cancel consumer',
-                            [ 'consumerTag' => $consumerTag ],
-                            $e
-                        );
-                    }
-                }
-            }
-
-            // Disconnect
-            try {
-                $this -> client -> disconnect();
-                $this -> log -> info('Disconnected from AMQP server');
-            } catch(Throwable $e) {
-                $error = 'Failed to disconnect from AMQP server';
-                $this -> log -> error($error, $e);
-                throw new AmqpClientException(
-                    $error,
-                    previous: $e
-                );
-            }
-        }
-    }
-
-    public function checkHealth() {
-        return new HealthCheckResult($this -> isConnected);
-    }
-
-    /****************************************
-     * PUBLIC METHODS
-     ****************************************/
 
     public function declareExchange(
         $exchange,
@@ -128,16 +35,15 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $internal = false,
         $arguments = []
     ) {
-        $this -> callChannel('default', 'exchangeDeclare', [
+        $this -> getConnection() -> declareExchange(
             $exchange,
             $type,
             $passive,
             $durable,
             $autoDelete,
             $internal,
-            false,
             $arguments
-        ]);
+        );
         return $this;
     }
 
@@ -145,10 +51,10 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $exchange,
         $ifUnused = false
     ) {
-        $this -> callChannel('default', 'exchangeDelete', [
+        $this -> getConnection() -> deleteExchange(
             $exchange,
             $ifUnused
-        ]);
+        );
         return $this;
     }
 
@@ -158,13 +64,12 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $routingKey = '',
         $arguments = []
     ) {
-        $this -> callChannel('default', 'exchangeBind', [
+        $this -> getConnection() -> bindExchange(
             $destination,
             $source,
             $routingKey,
-            false,
             $arguments
-        ]);
+        );
         return $this;
     }
 
@@ -174,13 +79,12 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $routingKey = '',
         $arguments = []
     ) {
-        $this -> callChannel('default', 'exchangeUnbind', [
+        $this -> getConnection() -> unbindExchange(
             $destination,
             $source,
             $routingKey,
-            false,
             $arguments
-        ]);
+        );
         return $this;
     }
 
@@ -192,15 +96,14 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $autoDelete = true,
         $arguments = []
     ) {
-        $this -> callChannel('default', 'queueDeclare', [
+        $this -> getConnection() -> declareQueue(
             $queue,
             $passive,
             $durable,
             $exclusive,
             $autoDelete,
-            false,
             $arguments
-        ]);
+        );
         return $this;
     }
 
@@ -209,11 +112,11 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $ifUnused = false,
         $ifEmpty = false
     ) {
-        $this -> callChannel('default', 'queueDelete', [
+        $this -> getConnection() -> deleteQueue(
             $queue,
             $ifUnused,
             $ifEmpty
-        ]);
+        );
         return $this;
     }
 
@@ -223,13 +126,12 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $routingKey = '',
         $arguments = []
     ) {
-        $this -> callChannel('default', 'queueBind', [
-            $exchange,
+        $this -> getConnection() -> bindQueue(
             $queue,
+            $exchange,
             $routingKey,
-            false,
             $arguments
-        ]);
+        );
         return $this;
     }
 
@@ -239,17 +141,17 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $routingKey = '',
         $arguments = []
     ) {
-        $this -> callChannel('default', 'queueUnbind', [
-            $exchange,
+        $this -> getConnection() -> unbindQueue(
             $queue,
+            $exchange,
             $routingKey,
             $arguments
-        ]);
+        );
         return $this;
     }
 
     public function purgeQueue($queue) {
-        $this -> callChannel('default', 'queuePurge', [ $queue ]);
+        $this -> getConnection() -> purgeQueue($queue);
         return $this;
     }
 
@@ -262,92 +164,15 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $immediate = false,
         $confirm = false
     ) {
-        if(($mandatory || $immediate) && !$confirm)
-            throw new AmqpClientException('Mandatory or immediate requires confirm to be true');
-
-        $this -> ensureConnected();
-
-        $channelName = 'publish';
-        if($confirm)
-            $channelName .= '_confirm';
-
-        if(!isset($this -> channels[$channelName])) {
-            $this -> callChannel($channelName, 'addReturnListener', [
-                function($message, $frame) {
-                    return $this -> onMessageReturn($message, $frame);
-                }
-            ]);
-            $this -> log -> debug(
-                'Configured channel return listener',
-                [ 'channelName' => $channelName ]
-            );
-
-            if($confirm) {
-                try {
-                    $this -> callChannel($channelName, 'confirmSelect', [
-                        function($frame) {
-                            return $this -> onConfirmFrame($frame);
-                        }
-                    ]);
-                    $this -> log -> debug(
-                        'Enabled channel confirm mode',
-                        [ 'channelName' => $channelName ]
-                    );
-                } catch(Throwable $e) {
-                    $error = 'Failed to enable channel confirm mode';
-                    $this -> log -> error(
-                        $error,
-                        [ 'channelName' => $channelName ],
-                        $e
-                    );
-                    throw new AmqpClientException(
-                        $error,
-                        previous: $e
-                    );
-                }
-
-                $this -> confirmDeferreds = [];
-            }
-        }
-
-        $messageId = $this -> genMessageId();
-        $headers['message-id'] = $messageId;
-
-        // Returns delivery tag only in confirm mode
-        $deliveryTag = $this -> callChannel($channelName, 'publish', [
+        return $this -> getConnection() -> publish(
             $body,
             $headers,
             $exchange,
             $routingKey,
             $mandatory,
-            $immediate
-        ]);
-
-        if($confirm) {
-            $confirmDeferred = new Deferred();
-            $this -> confirmDeferreds[$deliveryTag] = $confirmDeferred;
-
-            $this -> returnedMessages[$messageId] = null;
-
-            $exception = null;
-
-            try {
-                await($confirmDeferred -> promise());
-            } catch(AmqpClientException $e) {
-                $exception = $e;
-            }
-            unset($this -> confirmDeferreds[$deliveryTag]);
-
-            if($this -> returnedMessages[$messageId]) {
-                $exception = $this -> returnedMessages[$messageId];
-                unset($this -> returnedMessages[$messageId]);
-            }
-
-            if($exception)
-                throw $exception;
-        }
-
-        return $messageId;
+            $immediate,
+            $confirm
+        );
     }
 
     public function consume(
@@ -361,452 +186,25 @@ class AmqpClient implements StartStopInterface, HealthIndicatorInterface, EventE
         $concurrency = 1,
         $prefetchCount = null
     ) {
-        $this -> ensureConnected();
-
-        $consumerTag ??= bin2hex(random_bytes(8));
-        if(isset($this -> consumers[$consumerTag]))
-            throw new AmqpClientException("Consumer tag $consumerTag already in use");
-        $channelName = "consume_$consumerTag";
-
-        $prefetchCount ??= $concurrency;
-        try {
-            $this -> callChannel($channelName, 'qos', [
-                0,
-                $prefetchCount
-            ]);
-            $this -> log -> debug(
-                'Set channel prefetch count',
-                [ 'channelName' => $channelName, 'prefetchCount' => $prefetchCount ]
-            );
-        } catch(Throwable $e) {
-            $error = 'Failed to set channel prefetch count';
-            $this -> log -> error(
-                $error,
-                [ 'channelName' => $channelName, 'prefetchCount' => $prefetchCount ],
-                $e
-            );
-            throw new AmqpClientException(
-                $error,
-                previous: $e
-            );
-        }
-
-        $this -> callChannel($channelName, 'consume', [
-            async(function($message) use($consumerTag) {
-                return $this -> handleMessage($message, $consumerTag);
-            }),
+        return $this -> getConnection() -> consume(
             $queue,
+            $callback,
             $consumerTag,
             $noLocal,
             $noAck,
             $exclusive,
-            false,
             $arguments,
-            $concurrency
-        ]);
-
-        $this -> consumers[$consumerTag] = [
-            'callback' => $callback,
-            'noAck' => $noAck,
-            'pendingMessages' => 0,
-            'cancelDeferred' => null
-        ];
-        $this -> log -> debug(
-            'Created consumer',
-            [
-                'consumerTag' => $consumerTag,
-                'queue' => $queue,
-                'noLocal' => $noLocal,
-                'noAck' => $noAck,
-                'exclusive' => $exclusive,
-                'arguments' => $arguments,
-                'concurrency' => $concurrency,
-                'prefetchCount' => $prefetchCount
-            ]
+            $concurrency,
+            $prefetchCount
         );
-
-        return $consumerTag;
     }
 
     public function cancelConsumer($consumerTag) {
-        if(!isset($this -> consumers[$consumerTag]))
-            throw new AmqpClientException("Consumer $consumerTag does not exist");
-
-        $channelName = "consume_$consumerTag";
-
-        try {
-            $this -> callChannel($channelName, 'cancel', [ $consumerTag ]);
-            $this -> log -> debug(
-                'Consumer canceled on the server',
-                [ 'consumerTag' => $consumerTag ]
-            );
-        } catch(Throwable $e) {
-            $this -> log -> error(
-                'Failed to cancel consumer on the server',
-                [ 'consumerTag' => $consumerTag ],
-                $e
-            );
-            throw $e;
-        }
-
-        $pendingMessages = $this -> consumers[$consumerTag]['pendingMessages'];
-        if($pendingMessages > 0) {
-            $cancelDeferred = new Deferred();
-            $this -> consumers[$consumerTag]['cancelDeferred'] = $cancelDeferred;
-            $this -> log -> debug(
-                'Waiting to cleanup consumer',
-                [ 'consumerTag' => $consumerTag, 'pendingMessages' => $pendingMessages ]
-            );
-            try {
-                await($cancelDeferred -> promise());
-                $this -> log -> debug(
-                    'Ready to cleanup consumer',
-                    [ 'consumerTag' => $consumerTag ]
-                );
-            } catch(Throwable $e) {
-                $this -> log -> warning(
-                    'Forcing cleanup consumer',
-                    [ 'consumerTag' => $consumerTag, 'pendingMessages' => $pendingMessages ],
-                    $e
-                );
-            }
-        }
-
-        try {
-            $this -> closeChannel($channelName);
-            $this -> log -> debug(
-                'Closed consumer channel',
-                [ 'consumerTag' => $consumerTag, 'channelName' => $channelName ]
-            );
-        } catch(Throwable $e) {
-            $this -> log -> error(
-                'Failed to close consumer channel',
-                [ 'consumerTag' => $consumerTag, 'channelName' => $channelName ],
-                $e
-            );
-        }
-
-        unset($this -> consumers[$consumerTag]);
-        $this -> log -> debug(
-            'Cleaned up consumer',
-            [ 'consumerTag' => $consumerTag ]
-        );
-
+        $this -> getConnection() -> cancelConsumer($consumerTag);
         return $this;
     }
 
-    /****************************************
-     * CONNECTION INTERNALS
-     ****************************************/
-
-    private function connect() {
-        $this -> connectTask = new Task(function() {
-            return $this -> connectRoutine();
-        }) -> run();
-    }
-
-    private function connectRoutine() {
-        $this -> channels = [];
-        $this -> consumers = [];
-
-        $retryAfter = null;
-
-        while(true) {
-            try {
-                $this -> log -> debug('Trying to connect to AMQP server');
-
-                $this -> client = new Client($this -> clientConfig);
-                $this -> client -> once('close', function() {
-                   $this -> onConnectionClose();
-                });
-                $this -> client -> connect();
-
-                $this -> log -> info('Connected to AMQP server');
-
-                break;
-            } catch(Throwable $e) {
-                if(! $retryAfter)
-                    $retryAfter = 1;
-                else if($retryAfter == 1)
-                    $retryAfter = 5;
-                else if($retryAfter == 5)
-                    $retryAfter = 10;
-
-                $this -> log -> error(
-                    'Failed to connect to AMQP server',
-                    [ 'retryAfter' => $retryAfter ],
-                    $e
-                );
-                delay($retryAfter);
-            }
-        }
-
-        $this -> isConnected = true;
-        $this -> emit('connect');
-    }
-
-    private function onConnectionClose() {
-        $this -> isConnected = false;
-
-        // Reject all pending consumer cancelations
-        foreach($this -> consumers as $consumerTag => $consumer) {
-            if($consumer['pendingMessages'])
-                $this -> log -> warning(
-                    'Consumer aborted during message processing',
-                    [
-                        'consumerTag' => $consumerTag,
-                        'pendingMessages' => $consumer['pendingMessages']
-                    ]
-                );
-
-            if($consumer['cancelDeferred'])
-                $consumer['cancelDeferred'] -> reject(
-                    new AmqpClientException('Connection lost while still processing messages')
-                );
-        }
-
-        // Reject all delivery confirmations
-        $unconfirmedMessages = count($this -> confirmDeferreds);
-        if($unconfirmedMessages > 0) {
-            $this -> log -> warning(
-                'Connection closed while awaiting delivery confirmations',
-                [ 'unconfirmedMessages' => $unconfirmedMessages ]
-            );
-
-            foreach($this -> confirmDeferreds as $deferred)
-                $deferred -> reject(
-                    new AmqpClientException('Connection lost before delivery confirmation')
-                );
-        }
-
-        if($this -> isStopping)
-            return;
-
-        $this -> log -> warning('AMQP connection lost, reconnecting');
-        $this -> connect();
-    }
-
-    private function ensureConnected() {
-        if(! $this -> isConnected)
-            throw new AmqpClientException('Client is not connected');
-    }
-
-    /****************************************
-     * CHANNEL INTERNALS
-     ****************************************/
-
-    private function callChannel($channelName, $method, $args = []) {
-        $this -> ensureConnected();
-
-        $channel = $this -> getChannel($channelName);
-
-        try {
-            return call_user_func_array([$channel, $method], $args);
-        } catch(Throwable $e) {
-            throw new AmqpClientException(
-                $e -> getMessage(),
-                previous: $e
-            );
-        } finally {
-            /* TODO:
-             * Rabbit first resolves the promise that the channel method is awaiting.
-             * Then the channel method returns and further user code is executed.
-             * Only then does it emit 'close'.
-             * When calling two methods one after another, where the first one causes the channel to close,
-             * the second will execute on the closed channel, causing the connection to be closed.
-             * delay(0) returns control back to the point where 'close' is emitted.
-             */
-            delay(0);
-        }
-    }
-
-    private function getChannel($channelName) {
-        if(isset($this -> channels[$channelName]))
-            return $this -> channels[$channelName]['channel'];
-
-        try {
-            $channel = $this -> client -> channel();
-        } catch(Throwable $e) {
-            $error = 'Failed to open new channel';
-            $this -> log -> error(
-                $error,
-                [ 'channelName' => $channelName ],
-                $e
-            );
-            throw new AmqpClientException(
-                $error,
-                previous: $e
-            );
-        }
-
-        $channel -> once('close', function() use($channelName) {
-            $this -> onChannelClose($channelName);
-        });
-        $this -> channels[$channelName] = [
-            'channel' => $channel,
-            'isClosing' => false
-        ];
-
-        $channelId = $channel -> getChannelId();
-        $this -> log -> debug(
-            'Opened new channel',
-            [ 'channelName' => $channelName, 'channelId' => $channelId ]
-        );
-
-        return $channel;
-    }
-
-    private function closeChannel($channelName) {
-        if(!isset($this -> channels[$channelName]))
-            return;
-
-        $channelId = $this -> channels[$channelName]['channel'] -> getChannelId();
-        $this -> channels[$channelName]['isClosing'] = true;
-        $this -> channels[$channelName]['channel'] -> close();
-        delay(0); // TODO: Same case as callChannel()
-
-        unset($this -> channels[$channelName]);
-
-        $this -> log -> debug(
-            'Closed channel',
-            [ 'channelName' => $channelName, 'channelId' => $channelId ]
-        );
-    }
-
-    private function onChannelClose($channelName) {
-        if($this -> isStopping || $this -> channels[$channelName]['isClosing'])
-            return;
-
-        $channelId = $this -> channels[$channelName]['channel'] -> getChannelId();
-        $this -> log -> warning(
-            'Channel was unexpectedly closed',
-            [ 'channelName' => $channelName, 'channelId' => $channelId ]
-        );
-
-        unset($this -> channels[$channelName]);
-    }
-
-    /****************************************
-     * CONSUMING INTERNALS
-     ****************************************/
-
-    private function handleMessage($message, $consumerTag) {
-        $this -> log -> setContext('amqpMsgId', $message -> headers['message-id'] ?? null);
-
-        $this -> consumers[$consumerTag]['pendingMessages']++;
-
-        try {
-            $this -> consumers[$consumerTag]['callback']($message -> content, $message -> headers);
-
-            $action = 'ack';
-            $reason = null;
-        } catch(AmqpNackReject $e) {
-            $action = 'reject';
-            $reason = $e -> getMessage();
-        } catch(AmqpNackRequeue $e) {
-            $action = 'requeue';
-            $reason = $e -> getMessage();
-        } catch(Throwable $e) {
-            $action = 'requeue';
-            $reason = 'Uncaught exception in message handler';
-
-            $this -> log -> error(
-                $reason,
-                [ 'consumerTag' => $consumerTag ],
-                $e
-            );
-        }
-
-        if($this -> consumers[$consumerTag]['noAck']) {
-            if($action != 'ack')
-                $this -> log -> error(
-                    'Cannot ack message consumed with noAck flag',
-                    [ 'action' => $action, 'reason' => $reason, 'consumerTag' => $consumerTag ],
-                    $e
-                );
-        } else {
-            try {
-                if($action == 'ack')
-                    $this -> callChannel("consume_$consumerTag", 'ack', [$message]);
-                else if($action == 'reject')
-                    $this -> callChannel("consume_$consumerTag", 'reject', [$message, false]);
-                else
-                    $this -> callChannel("consume_$consumerTag", 'reject', [$message, true]);
-            } catch(Throwable $e) {
-                $this -> log -> error(
-                    'Failed to ack message',
-                    [ 'action' => $action, 'reason' => $reason, 'consumerTag' => $consumerTag ],
-                    $e
-                );
-            }
-        }
-
-        $this -> consumers[$consumerTag]['pendingMessages']--;
-
-        if(
-            $this -> consumers[$consumerTag]['pendingMessages'] == 0 &&
-            $this -> consumers[$consumerTag]['cancelDeferred']
-        ) {
-            $this -> consumers[$consumerTag]['cancelDeferred'] -> resolve(null);
-        }
-    }
-
-    /****************************************
-     * PUBLISHING INTERNALS
-     ****************************************/
-
-    private function onConfirmFrame($frame) {
-        $ack = ! $frame instanceof MethodBasicNackFrame;
-
-        if(! $ack)
-            $this -> log -> warning(
-                'Received negative acknowledgment',
-                [ 'multiple' => $frame -> multiple, 'deliveryTag' => $frame -> deliveryTag ]
-            );
-
-        if($frame -> multiple) {
-            foreach($this -> confirmDeferreds as $dtag => $_) {
-                if($dtag > $frame -> deliveryTag)
-                    break;
-
-                $this -> fulfillConfirmDeferred($dtag, $ack);
-            }
-        } else {
-            $this -> fulfillConfirmDeferred($frame -> deliveryTag, $ack);
-        }
-    }
-
-    private function fulfillConfirmDeferred($deliveryTag, $ack) {
-        if($ack)
-            $this -> confirmDeferreds[$deliveryTag] -> resolve(null);
-        else
-            $this -> confirmDeferreds[$deliveryTag] -> reject(
-                new AmqpClientException('Negative acknowledgment received from the server')
-            );
-    }
-
-    private function onMessageReturn($message, $frame) {
-        $messageId = $message -> headers['message-id'];
-
-        $this -> log -> debug(
-            'Message was returned',
-            [ 'messageId' => $messageId, 'replyText' => $frame -> replyText ]
-        );
-
-        if(array_key_exists($messageId, $this -> returnedMessages))
-            $this -> returnedMessages[$messageId] = new AmqpReturnException($frame -> replyText);
-        else
-            $this -> log -> warning(
-                'Unhandled return of message',
-                [ 'messageId' => $messageId ]
-            );
-    }
-
-    private function genMessageId() {
-        // UUID v4
-        $data = random_bytes(16);
-        $data[6] = chr(ord($data[6]) & 0x0f | 0x40);
-        $data[8] = chr(ord($data[8]) & 0x3f | 0x80);
-        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+    protected function createConnection() {
+        return new AmqpConnection($this -> log, $this -> options);
     }
 }

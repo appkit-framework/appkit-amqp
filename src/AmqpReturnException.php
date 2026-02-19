@@ -2,4 +2,4 @@
 
 namespace AppKit\Amqp;
 
-class AmqpReturnException extends AmqpClientException {}
+class AmqpReturnException extends AmqpConnectionException {}
