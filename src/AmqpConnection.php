@@ -46,6 +46,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $internal = false,
         $arguments = []
     ) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'exchangeDeclare', [
             $exchange,
             $type,
@@ -62,6 +63,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $exchange,
         $ifUnused = false
     ) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'exchangeDelete', [
             $exchange,
             $ifUnused
@@ -74,6 +76,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $routingKey = '',
         $arguments = []
     ) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'exchangeBind', [
             $destination,
             $source,
@@ -89,6 +92,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $routingKey = '',
         $arguments = []
     ) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'exchangeUnbind', [
             $destination,
             $source,
@@ -106,6 +110,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $autoDelete = true,
         $arguments = []
     ) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'queueDeclare', [
             $queue,
             $passive,
@@ -122,6 +127,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $ifUnused = false,
         $ifEmpty = false
     ) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'queueDelete', [
             $queue,
             $ifUnused,
@@ -135,6 +141,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $routingKey = '',
         $arguments = []
     ) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'queueBind', [
             $exchange,
             $queue,
@@ -150,6 +157,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $routingKey = '',
         $arguments = []
     ) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'queueUnbind', [
             $exchange,
             $queue,
@@ -159,6 +167,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
     }
 
     public function purgeQueue($queue) {
+        $this -> ensureConnected();
         $this -> callChannel('default', 'queuePurge', [ $queue ]);
     }
 
@@ -171,6 +180,8 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $immediate = false,
         $confirm = false
     ) {
+        $this -> ensureConnected();
+
         if(($mandatory || $immediate) && !$confirm)
             throw new AmqpConnectionException('Mandatory or immediate requires confirm to be true');
 
@@ -266,6 +277,8 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
         $concurrency = 1,
         $prefetchCount = null
     ) {
+        $this -> ensureConnected();
+
         $consumerTag ??= bin2hex(random_bytes(8));
         if(isset($this -> consumers[$consumerTag]))
             throw new AmqpConnectionException("Consumer tag $consumerTag already in use");
@@ -332,68 +345,8 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
     }
 
     public function cancelConsumer($consumerTag) {
-        if(!isset($this -> consumers[$consumerTag]))
-            throw new AmqpConnectionException("Consumer $consumerTag does not exist");
-
-        $channelName = "consume_$consumerTag";
-
-        try {
-            $this -> callChannel($channelName, 'cancel', [ $consumerTag ]);
-            $this -> log -> debug(
-                'Consumer canceled on the server',
-                [ 'consumerTag' => $consumerTag ]
-            );
-        } catch(Throwable $e) {
-            $this -> log -> error(
-                'Failed to cancel consumer on the server',
-                [ 'consumerTag' => $consumerTag ],
-                $e
-            );
-            throw $e;
-        }
-
-        $pendingMessages = $this -> consumers[$consumerTag]['pendingMessages'];
-        if($pendingMessages > 0) {
-            $cancelDeferred = new Deferred();
-            $this -> consumers[$consumerTag]['cancelDeferred'] = $cancelDeferred;
-            $this -> log -> debug(
-                'Waiting to cleanup consumer',
-                [ 'consumerTag' => $consumerTag, 'pendingMessages' => $pendingMessages ]
-            );
-            try {
-                await($cancelDeferred -> promise());
-                $this -> log -> debug(
-                    'Ready to cleanup consumer',
-                    [ 'consumerTag' => $consumerTag ]
-                );
-            } catch(Throwable $e) {
-                $this -> log -> warning(
-                    'Forcing cleanup consumer',
-                    [ 'consumerTag' => $consumerTag, 'pendingMessages' => $pendingMessages ],
-                    $e
-                );
-            }
-        }
-
-        try {
-            $this -> closeChannel($channelName);
-            $this -> log -> debug(
-                'Closed consumer channel',
-                [ 'consumerTag' => $consumerTag, 'channelName' => $channelName ]
-            );
-        } catch(Throwable $e) {
-            $this -> log -> error(
-                'Failed to close consumer channel',
-                [ 'consumerTag' => $consumerTag, 'channelName' => $channelName ],
-                $e
-            );
-        }
-
-        unset($this -> consumers[$consumerTag]);
-        $this -> log -> debug(
-            'Cleaned up consumer',
-            [ 'consumerTag' => $consumerTag ]
-        );
+        $this -> ensureConnected();
+        $this -> cancelConsumerInt($consumerTag);
     }
 
     /****************************************
@@ -420,7 +373,7 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
 
             foreach($this -> consumers as $consumerTag => $_) {
                 try {
-                    $this -> cancelConsumer($consumerTag);
+                    $this -> cancelConsumerInt($consumerTag);
                     $this -> log -> info(
                         'Canceled consumer',
                         [ 'consumerTag' => $consumerTag ]);
@@ -571,6 +524,71 @@ class AmqpConnection extends AbstractClientConnection implements AmqpInterface {
     /****************************************
      * CONSUMING INTERNALS
      ****************************************/
+
+    private function cancelConsumerInt($consumerTag) {
+        if(!isset($this -> consumers[$consumerTag]))
+            throw new AmqpConnectionException("Consumer $consumerTag does not exist");
+
+        $channelName = "consume_$consumerTag";
+
+        try {
+            $this -> callChannel($channelName, 'cancel', [ $consumerTag ]);
+            $this -> log -> debug(
+                'Consumer canceled on the server',
+                [ 'consumerTag' => $consumerTag ]
+            );
+        } catch(Throwable $e) {
+            $this -> log -> error(
+                'Failed to cancel consumer on the server',
+                [ 'consumerTag' => $consumerTag ],
+                $e
+            );
+            throw $e;
+        }
+
+        $pendingMessages = $this -> consumers[$consumerTag]['pendingMessages'];
+        if($pendingMessages > 0) {
+            $cancelDeferred = new Deferred();
+            $this -> consumers[$consumerTag]['cancelDeferred'] = $cancelDeferred;
+            $this -> log -> debug(
+                'Waiting to cleanup consumer',
+                [ 'consumerTag' => $consumerTag, 'pendingMessages' => $pendingMessages ]
+            );
+            try {
+                await($cancelDeferred -> promise());
+                $this -> log -> debug(
+                    'Ready to cleanup consumer',
+                    [ 'consumerTag' => $consumerTag ]
+                );
+            } catch(Throwable $e) {
+                $this -> log -> warning(
+                    'Forcing cleanup consumer',
+                    [ 'consumerTag' => $consumerTag, 'pendingMessages' => $pendingMessages ],
+                    $e
+                );
+            }
+        }
+
+        try {
+            $this -> closeChannel($channelName);
+            $this -> log -> debug(
+                'Closed consumer channel',
+                [ 'consumerTag' => $consumerTag, 'channelName' => $channelName ]
+            );
+        } catch(Throwable $e) {
+            $this -> log -> error(
+                'Failed to close consumer channel',
+                [ 'consumerTag' => $consumerTag, 'channelName' => $channelName ],
+                $e
+            );
+        }
+
+        unset($this -> consumers[$consumerTag]);
+        $this -> log -> debug(
+            'Cleaned up consumer',
+            [ 'consumerTag' => $consumerTag ]
+        );
+    }
 
     private function handleMessage($message, $consumerTag) {
         $this -> log -> setContext('amqpMsgId', $message -> headers['message-id'] ?? null);
